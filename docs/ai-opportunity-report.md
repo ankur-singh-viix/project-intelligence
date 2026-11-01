@@ -77,6 +77,8 @@ The resulting technical brief follows a consistent schema containing:
 - Missing information and clarification questions
 - Technical and operational risk assessment
 
+The schema is fixed, so business objectives and user roles appear as labelled entries in the feature list, and assumptions and implementation considerations as labelled parts of the risk text.
+
 This structured approach makes the output easier to validate, display, reuse, and integrate into future business workflows.
 
 **4. Technical Discovery Dashboard**
@@ -100,9 +102,13 @@ The proof of concept uses the following technology stack:
 | AI integration | Official provider SDKs (Google GenAI, OpenAI) and OpenAI-compatible APIs | Communication with the chosen LLM |
 | Configuration | python-dotenv | Environment-based API key management |
 
-The system also includes a mock execution mode that demonstrates the dashboard using clearly labelled sample data without requiring a live API call.
+The prototype produces a brief in one of three clearly labelled ways:
 
-This makes the prototype usable for demonstration and testing while keeping sample output distinguishable from actual AI-generated analysis.
+- **Live AI analysis:** the selected provider's model analyses the enquiry.
+- **Rule-based fallback:** if the provider is not configured or the request fails, a keyword-rule brief is built from the enquiry, with the reason shown. It is not AI output and is only a rough outline.
+- **Mock Mode:** predefined Healthcare SaaS sample data for demonstrations without any API key, shown only when the user enables it.
+
+This keeps the prototype usable for demonstration and testing while keeping sample and fallback output distinguishable from actual AI-generated analysis.
 
 ## 4. Business Value for Cynbit
 

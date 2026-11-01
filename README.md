@@ -32,9 +32,9 @@ The generated brief can also be downloaded as a JSON file.
 - **Risk assessment:** Highlights potential security, scalability, integration, and operational risks.
 - **Multiple AI providers:** Choose Google Gemini, OpenAI (GPT), Groq, or local Ollama models from the sidebar; the provider layer is designed so more can be added.
 - **Structured output validation:** Every provider's output is validated against the same Pydantic `ProjectBrief` schema.
-- **Interactive dashboard:** Provides a clean Streamlit interface for submitting enquiries and reviewing results.
+- **Interactive dashboard:** Provides a Streamlit interface for submitting enquiries and reviewing results, with a connection status indicator and light and dark styling that follows the active Streamlit theme.
 - **JSON export:** Downloads the generated discovery brief in a structured JSON format.
-- **Mock execution mode:** Demonstrates the application without requiring any provider or API key.
+- **Mock execution mode:** Demonstrates the application without requiring any provider or API key, using clearly labelled predefined sample data.
 - **Transparent fallback:** If credentials are missing or a live request fails, a rule-based brief built from your own enquiry is shown (keyword rules, not AI), labelled as fallback together with the reason. It is never presented as a live result, and the Healthcare sample is used only in Mock Mode.
 
 ## Technology Stack
@@ -63,10 +63,14 @@ project-intelligence/
 │   │   ├── ollama_provider.py   # Ollama (local)
 │   │   └── __init__.py          # Provider registry and factory
 │   ├── analyzer.py              # Provider-independent analysis and fallback handling
+│   ├── fallback.py              # Rule-based (non-AI) brief used when live analysis is unavailable
 │   ├── models.py                # Pydantic response models
 │   └── prompts.py               # System prompt and instructions
 │
 ├── tests/                       # pytest suite (no real API calls)
+├── .streamlit/
+│   └── config.toml              # Base Streamlit theme (secrets.toml is git-ignored)
+├── .devcontainer/               # Dev container / Codespaces configuration
 ├── docs/
 │   ├── ai-opportunity-report.md
 │   └── technical-approach.md
@@ -209,6 +213,14 @@ Keys loaded from secrets or the environment are never shown in the UI; the field
 
 ## Usage Modes
 
+The app always labels how a brief was produced. These three outcomes are different:
+
+| Outcome | When it happens | Produced by |
+|---|---|---|
+| **Live AI analysis** | A provider is configured and its request succeeds | The selected AI model |
+| **Rule-based fallback** | The provider is not configured, or the live request failed | Keyword rules applied to your enquiry (`core/fallback.py`), not an AI model |
+| **Mock Mode** | You enable **Enable Mock Mode (Testing)** | Predefined Healthcare SaaS sample data, unrelated to your enquiry |
+
 ### 1. Live Mode
 
 1. Choose a provider and model, and make sure it has a key (or, for Ollama, a running server).
@@ -233,7 +245,7 @@ Mock Mode lets you evaluate the dashboard without any provider or key.
 2. Enter any enquiry and select **Generate Discovery Brief**.
 3. Review the predefined Healthcare SaaS sample output.
 
-Mock Mode is also used automatically when the selected provider has no key configured; the result states that reason.
+Mock Mode is never switched on automatically. If the selected provider has no key configured and Mock Mode is off, the app shows the rule-based fallback and states that the provider is not configured.
 
 **Note:** Mock output is predefined Healthcare SaaS sample data and does not reflect the submitted enquiry.
 
@@ -290,7 +302,7 @@ GROQ_API_KEY = "..."
 OLLAMA_BASE_URL = "http://your-ollama-host:11434"
 ```
 
-Only configure the providers you intend to offer. Use Python 3.10 or newer (select it in the app's advanced settings on Streamlit Community Cloud). **Ollama on your own computer is not reachable from Streamlit Community Cloud**: a hosted app cannot reach `localhost` on your machine, so Ollama needs a server the app can reach (and you should not expose it publicly without protection). Deployments with shared keys should also add authentication and usage limits, which this prototype does not include.
+Only configure the providers you intend to offer. Set the main file path to `app.py` and use Python 3.10 or newer (the dev container uses 3.11); on Streamlit Community Cloud the Python version is chosen in the app's advanced settings. **Ollama on your own computer is not reachable from Streamlit Community Cloud**: a hosted app cannot reach `localhost` on your machine, so Ollama needs a server the app can reach (and you should not expose it publicly without protection). Deployments with shared keys should also add authentication and usage limits, which this prototype does not include.
 
 ## Running the Tests
 
@@ -312,7 +324,7 @@ The tests mock every provider SDK, so they need no API keys, network access or p
 | "... does not support the JSON/structured output" | Choose a different model; some models (for example Gemma on Gemini) cannot return JSON. |
 | "... denied access" | The key's project or region is not allowed to use that API or model. Check the project in the provider console. |
 | "... billing or account restriction" | Enable billing or resolve the account issue with the provider. |
-| "Could not list available models" | The key is wrong, or the provider is unreachable. The built-in names are shown instead; you can still enter a custom model. |
+| "Could not list available models" | Listing failed (wrong key, missing permission, or provider unreachable); expand **Discovery details** for the redacted reason. The built-in names are shown instead, generation still works, and you can enter a custom model. |
 | "Could not reach the Ollama server" | Start Ollama (`ollama serve`) and check the Server URL. For a model that is not downloaded, run `ollama pull <model>`. |
 | "returned a response that does not match the expected brief structure" | The model did not produce valid JSON for the schema. Retry or use a larger or different model. |
 | Sample Healthcare data appears for an unrelated enquiry | That only happens in Mock Mode. Turn off **Enable Mock Mode (Testing)**. |
@@ -331,6 +343,7 @@ Additional project documentation:
 This repository demonstrates a proof of concept, not a complete production deployment.
 
 - Mock Mode uses predefined sample data rather than performing AI inference.
+- Light and dark styling is covered by Streamlit app tests and manual browser checks, not by testing every browser and device.
 - The rule-based fallback recognises only a handful of common business domains by keywords. It cannot understand an enquiry the way a model can, so it is a rough outline, not an analysis.
 - Provider integrations are covered by mocked automated tests; they have not been exercised against the live provider APIs by the automated suite. Model discovery depends on each provider's listing API, and Gemini rate-limit and quota responses are told apart on a best-effort basis from the provider's message.
 - The built-in fallback model names are not verified and may be outdated.

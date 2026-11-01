@@ -19,7 +19,7 @@ The architecture follows a simple application-layer design:
 3. **Provider Layer:** A common provider interface with interchangeable implementations for Google Gemini, OpenAI, Groq, and Ollama (local). Each provider handles its own SDK calls, configuration checks, and error translation.
 4. **Prompt Engineering Layer:** A dedicated system prompt guides the LLM to behave like a software solutions architect. All providers share it.
 5. **Data Validation Layer:** Pydantic models define the expected response structure, and every provider's output is validated against them.
-6. **Fallback Layer:** Mock execution and error-handling mechanisms allow the application to demonstrate its functionality without depending entirely on API availability.
+6. **Fallback Layer:** A Mock Mode (predefined sample data) and a rule-based fallback (`core/fallback.py`, keyword rules, no AI) keep the application usable when credentials are missing or a live request fails. Each is labelled distinctly from live AI output.
 
 ### 1.2 Technology Choices
 
@@ -42,10 +42,10 @@ The application separates user interaction, AI processing, and data validation t
 
 1. A user selects a provider and model, then enters a client project enquiry in the Streamlit dashboard.
 2. The frontend passes the enquiry and provider settings to `analyze_with_status()` (`analyze_project_enquiry()` remains as a wrapper that returns only the brief).
-3. The analyzer creates the selected provider through the provider factory.
+3. If Mock Mode is on, the analyzer returns the predefined sample and makes no request. Otherwise it creates the selected provider through the provider factory.
 4. The provider validates its configuration, combines the enquiry with the shared system prompt, and calls its backend.
 5. The response is parsed into the `ProjectBrief` Pydantic model and validated.
-6. The analyzer returns an `AnalysisResult` containing the brief, its source (`live`, `mock`, or `fallback`), the provider and model, and any error.
+6. If the provider is not configured or the request fails, the analyzer builds a rule-based brief from the enquiry instead (section 5.4). It returns an `AnalysisResult` containing the brief, its source (`live`, `mock`, or `fallback`), the provider and model, and any error.
 7. Streamlit displays the source label, any failure reason, the project overview, technology recommendations, features, clarification questions, and risk assessment.
 
 This modular structure makes it easier to maintain the application and extend its capabilities.
@@ -70,7 +70,17 @@ GPT-4o-mini is a suitable choice for this proof of concept because of the follow
 - **Structured generation:** Works with the OpenAI structured-output parsing workflow used in this implementation.
 - **Practical scalability:** Provides a reasonable starting point for evaluating an AI-assisted discovery workflow before considering more advanced models.
 
-### 2.2 Why Not Train a Custom Model?
+### 2.2 Gemini Model Discovery
+
+Gemini model names are retired and renamed often, so the Gemini provider asks the SDK which models the configured key can use:
+
+- The listing keeps models that support `generateContent` and drops embedding, image, audio, video, live, text-to-speech and Gemma models, which cannot return the JSON this app needs. The client is kept alive while the paginated listing is read.
+- The default is the newest stable Flash model in that list; the built-in `*-latest` aliases are used only if listing fails.
+- Before generating, the provider checks that the selected model exists and supports `generateContent`, so a missing or unsupported model gives a specific error.
+- The app never switches to a different model on its own. A failed model stays selected and is named in the error.
+- A failed listing does not block generation. The sidebar shows the redacted reason under **Discovery details** and offers the built-in names plus **Custom model name...**.
+
+### 2.3 Why Not Train a Custom Model?
 
 Training a custom model would require a representative dataset of historical project enquiries, manually labelled requirements, technical recommendations, and validated discovery outcomes.
 
@@ -185,7 +195,7 @@ The Copilot includes a mock execution mode and analyzer-level fallback handling 
 
 The Streamlit interface provides an **Enable Mock Mode (Testing)** toggle.
 
-When enabled, the application uses predefined Healthcare SaaS sample data rather than making a live OpenAI API request.
+When enabled, the application uses predefined Healthcare SaaS sample data and makes no provider request.
 
 This supports:
 
@@ -200,13 +210,15 @@ The interface explicitly labels mock output as sample data and warns users that 
 
 The application resolves the selected provider's API key in this order: a key entered in the sidebar for the current session, Streamlit secrets, then environment variables (`GOOGLE_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`). Ollama needs no key; it uses `OLLAMA_BASE_URL` or the default local URL.
 
-If the selected provider is not configured, the application runs in mock mode, explains which setting is missing, and shows setup instructions.
+If the selected provider is not configured and Mock Mode is off, the application does not call any model. It explains which setting is missing, shows setup instructions, and displays the rule-based fallback (section 5.4). Mock Mode is never enabled automatically.
 
 ### 5.4 API Failure Handling
 
 Each provider translates its SDK's exceptions into a small set of normalised errors: missing key, invalid key, permission or project access denied, rate limit, quota exhausted, billing restriction, network failure, provider unavailable, model not found, model does not support the required output, invalid structured output, and (for Ollama) server not running. Distinct failures are never collapsed into one generic message; for example, a missing model and an unsupported-output model produce different errors. Each message includes the provider's own HTTP status and message, after redacting the configured key and known key formats.
 
 When a live request fails, or the selected provider is not configured, the analyzer logs only the provider and error code, and returns an `AnalysisResult` whose source is `fallback`, whose error explains the failure, and whose brief is built from the user's own enquiry by a small keyword-rule generator (`core/fallback.py`). That brief is not AI output: it recognises a few common business domains, extracts mentioned user roles and capabilities, marks everything else as assumed, and says in its assumptions that it is rule-based. The interface shows the error, labels the output as a rule-based fallback, and never presents it as a live result. The predefined Healthcare sample is returned only in Mock Mode, so a failed call can never show data about an unrelated project.
+
+The page header also shows a connection status indicator for the selected provider (for example not configured, connected, model verified, quota exhausted, connection issue). It reflects discovery and generation results for the current key and model, and a successful generation outranks an earlier discovery failure.
 
 Gemini returns rate-limit and quota exhaustion under the same HTTP status, so they are told apart on a best-effort basis from the quota identifiers in the provider's message. OpenAI-compatible JSON mode is retried once without the JSON option if a model rejects it, and the reply is still validated against the schema.
 
@@ -217,9 +229,19 @@ The prototype follows basic credential-handling practices:
 - API keys are loaded from Streamlit secrets or environment variables, or entered through a password-type sidebar field. Keys from secrets or the environment are never pre-filled into the interface.
 - The `.env` file is excluded from Git through `.gitignore`.
 - Sensitive API credentials are not intentionally displayed in the interface.
-- Error reporting avoids exposing full exception messages or API credentials.
+- Error details shown in the interface (the **Technical details** and **Discovery details** expanders) are the provider's own message, or the exception type and message, after the configured key and known key formats are redacted. Logs record only the provider and error code.
 
 A production deployment would require additional controls such as managed secrets, authentication, access control, request monitoring, rate limiting, and appropriate data-retention policies.
+
+### 5.6 Testing
+
+The pytest suite (`python -m pytest tests`) makes no real provider calls and needs no keys or network access:
+
+- Provider, analyzer and fallback unit tests use mocked SDK clients, covering error translation, discovery filtering, default model selection, structured-output validation and key redaction.
+- Streamlit's `AppTest` drives the interface: Mock Mode, rule-based fallback labelling, connection status, model selection, JSON export, state kept across reruns, and light and dark theme styling.
+- Gemini tests run the real `google-genai` SDK against a local stub HTTP server to reproduce listing, success, quota and listing-failure scenarios, including that the Healthcare sample appears only in Mock Mode.
+
+These tests verify the application logic around the SDKs. They do not prove how the live provider APIs behave; that requires separate manual testing with real credentials.
 
 ---
 
