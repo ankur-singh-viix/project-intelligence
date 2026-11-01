@@ -28,6 +28,7 @@ class ErrorCode:
 
     MISSING_KEY = "missing_key"
     INVALID_CONFIG = "invalid_config"
+    INVALID_REQUEST = "invalid_request"
     AUTH = "auth"
     PERMISSION = "permission"
     RATE_LIMIT = "rate_limit"
@@ -46,8 +47,9 @@ _MESSAGES = {
     ErrorCode.INVALID_CONFIG: "The {label} configuration is invalid.",
     ErrorCode.AUTH: "{label} rejected the API key. Check that the key is correct and has not been revoked.",
     ErrorCode.PERMISSION: "{label} denied access. The key or its project may not be allowed to use this model, API or region.",
-    ErrorCode.RATE_LIMIT: "{label} rate limit reached. Wait a moment and retry.",
-    ErrorCode.QUOTA: "{label} quota is exhausted. Check your plan, usage limits and billing with the provider.",
+    ErrorCode.INVALID_REQUEST: "{label} rejected the request as invalid. The selected model may not support this generation configuration; refresh the model list or choose another model.",
+    ErrorCode.RATE_LIMIT: "{label} rate limit reached for the selected model. Wait a moment and retry. Quotas can be shared across models, so switching models may not help.",
+    ErrorCode.QUOTA: "{label} quota is exhausted for the selected model or project. Quotas can be shared across models, so switching models may not help. Check usage limits and billing with the provider.",
     ErrorCode.BILLING: "{label} reports a billing or account restriction. Check billing and account status with the provider.",
     ErrorCode.NETWORK: "Could not connect to {label}. Check your network connection and try again.",
     ErrorCode.UNAVAILABLE: "{label} is currently unavailable. Try again later.",
@@ -70,9 +72,9 @@ class ProviderError(Exception):
         self.code = code
         self.label = label
         self.detail = detail
-        message = _MESSAGES.get(code, _MESSAGES[ErrorCode.UNKNOWN]).format(label=label)
-        if detail:
-            message = f"{message} {detail}"
+        # `summary` is the concise, fixed text; `message` adds the redacted provider detail.
+        self.summary = _MESSAGES.get(code, _MESSAGES[ErrorCode.UNKNOWN]).format(label=label)
+        message = f"{self.summary} {detail}" if detail else self.summary
         self.message = message
         super().__init__(message)
 
@@ -189,7 +191,7 @@ class BaseProvider(ABC):
         """Build a ProviderError labelled with this provider."""
         return ProviderError(code, self.label, detail)
 
-    def safe_detail(self, exc: Exception, max_length: int = 240) -> str | None:
+    def safe_detail(self, exc: Exception, max_length: int = 500) -> str | None:
         """Describe an SDK exception for display, with credentials redacted.
 
         Only the HTTP status and the provider's own error message are used, never
@@ -215,6 +217,13 @@ class BaseProvider(ABC):
         if len(text) > max_length:
             text = text[: max_length - 3] + "..."
         return f"Provider response: {text}"
+
+    def describe_exception(self, exc: Exception, max_length: int = 300) -> str:
+        """Return "(ClassName: message)" for an arbitrary exception, with secrets redacted."""
+        message = redact(" ".join(str(exc).split()), (self.api_key,))
+        if len(message) > max_length:
+            message = message[: max_length - 3] + "..."
+        return f"({type(exc).__name__}: {message})" if message else f"({type(exc).__name__})"
 
     def validate_config(self) -> None:
         """Raise ProviderError if the provider cannot be called as configured."""
@@ -280,7 +289,8 @@ class BaseProvider(ABC):
             return self.error(ErrorCode.INVALID_OUTPUT)
         if isinstance(exc, (ConnectionError, TimeoutError)):
             return self.error(ErrorCode.NETWORK)
-        return self.error(ErrorCode.UNKNOWN)
+        # Class name plus the message with the key and key-like tokens redacted.
+        return self.error(ErrorCode.UNKNOWN, self.describe_exception(exc))
 
     def parse_json_output(self, text: str | None) -> ProjectBrief:
         """Parse raw model text into a ProjectBrief, tolerating Markdown fences.

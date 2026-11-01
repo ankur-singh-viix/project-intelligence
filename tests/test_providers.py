@@ -541,3 +541,93 @@ def test_every_provider_returns_a_valid_projectbrief(monkeypatch):
     for pid in PROVIDER_REGISTRY:
         brief = get_provider(pid, api_key="k").analyze("x")
         assert isinstance(brief, ProjectBrief) and brief == make_brief()
+
+
+# ------------------------------------------------------------ Gemini: classification and validation
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        ("You exceeded your current quota, please check your plan and billing details.", ErrorCode.QUOTA),
+        ("Quota exceeded: GenerateRequestsPerMinutePerProjectPerModel-FreeTier", ErrorCode.RATE_LIMIT),
+        ("Quota exceeded: GenerateRequestsPerDayPerProjectPerModel and GenerateRequestsPerMinutePerProjectPerModel", ErrorCode.QUOTA),
+        ("Resource has been exhausted", ErrorCode.RATE_LIMIT),
+    ],
+)
+def test_gemini_429_is_quota_or_rate_limit_never_a_connection_error(monkeypatch, message, expected):
+    err = _gemini_api_error(genai_errors.ClientError, 429, "RESOURCE_EXHAUSTED", message)
+    _patch_gemini(monkeypatch, gemini_client(error=err))
+    with pytest.raises(ProviderError) as exc:
+        get_provider("gemini", api_key="k").analyze("x")
+    assert exc.value.code == expected
+    assert exc.value.code not in (ErrorCode.NETWORK, ErrorCode.UNAVAILABLE)
+    assert "switching models may not help" in exc.value.message
+
+
+def test_gemini_400_is_an_invalid_request_not_a_connection_problem(monkeypatch):
+    err = _gemini_api_error(genai_errors.ClientError, 400, "INVALID_ARGUMENT", "Unknown field in generation config")
+    _patch_gemini(monkeypatch, gemini_client(error=err))
+    with pytest.raises(ProviderError) as exc:
+        get_provider("gemini", api_key="k").analyze("x")
+    assert exc.value.code == ErrorCode.INVALID_REQUEST and "invalid" in exc.value.summary
+
+
+def test_provider_error_separates_summary_from_detail():
+    err = ProviderError(ErrorCode.QUOTA, "X", "Provider response: HTTP 429")
+    assert "Provider response" not in err.summary and "Provider response" in err.message
+
+
+def test_gemini_checks_the_model_before_generating(monkeypatch):
+    not_found = _gemini_api_error(genai_errors.ClientError, 404, "NOT_FOUND", "models/old is not found")
+    client = gemini_client(text=brief_json())
+    client.models.get.side_effect = not_found
+    _patch_gemini(monkeypatch, client)
+    with pytest.raises(ProviderError) as exc:
+        get_provider("gemini", api_key=SECRET, model="old").analyze("x")
+    assert exc.value.code == ErrorCode.MODEL_NOT_FOUND and "old" in exc.value.message
+    client.models.generate_content.assert_not_called()
+
+
+def test_gemini_rejects_models_that_cannot_generate_text(monkeypatch):
+    client = gemini_client(text=brief_json())
+    client.models.get.return_value = SimpleNamespace(supported_actions=["embedContent"])
+    _patch_gemini(monkeypatch, client)
+    with pytest.raises(ProviderError) as exc:
+        get_provider("gemini", api_key="k", model="gemini-embedding-001").analyze("x")
+    assert exc.value.code == ErrorCode.UNSUPPORTED_MODEL and "Refresh the model list" in exc.value.message
+    client.models.generate_content.assert_not_called()
+
+
+def test_gemini_model_lookup_failures_do_not_block_generation(monkeypatch):
+    for failure in (
+        _gemini_api_error(genai_errors.ClientError, 429, "RESOURCE_EXHAUSTED", "slow down"),
+        _gemini_api_error(genai_errors.ServerError, 503, "UNAVAILABLE", "busy"),
+        RuntimeError("socket closed"),
+    ):
+        client = gemini_client(text=brief_json())
+        client.models.get.side_effect = failure
+        _patch_gemini(monkeypatch, client)
+        assert get_provider("gemini", api_key="k").analyze("x") == make_brief()
+
+
+def test_gemini_lookup_and_generation_share_one_client_and_key(monkeypatch):
+    client = gemini_client(text=brief_json())
+    factory = _patch_gemini(monkeypatch, client)
+    get_provider("gemini", api_key=SECRET).analyze("x")
+    assert factory.call_count == 1 and factory.call_args.kwargs == {"api_key": SECRET}
+
+
+def test_gemini_discovery_excludes_video_and_other_incompatible_models(monkeypatch):
+    client = MagicMock()
+    client.models.list.return_value = iter(
+        [
+            _gemini_model("gemini-3-flash"),
+            _gemini_model("veo-3.1-generate-preview", actions=("predictLongRunning",)),
+            _gemini_model("gemini-3-video", actions=("generateContent",)),
+            _gemini_model("gemini-2.5-flash-preview-tts"),
+            _gemini_model("gemini-embedding-001", actions=("embedContent",)),
+            _gemini_model("gemini-3-flash-image"),
+            _gemini_model("gemini-3-flash-live", actions=("bidiGenerateContent",)),
+        ]
+    )
+    _patch_gemini(monkeypatch, client)
+    assert [m.id for m in get_provider("gemini", api_key="k").discover_models()] == ["gemini-3-flash"]

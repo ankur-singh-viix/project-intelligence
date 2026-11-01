@@ -9,6 +9,7 @@ import logging
 from dataclasses import dataclass
 from typing import Literal
 
+from core.fallback import build_rule_based_brief
 from core.models import ProjectBrief, TechStack
 from core.providers import ProviderError, get_provider
 
@@ -25,9 +26,9 @@ class AnalysisResult:
 
     Attributes:
         brief: The validated brief.
-        source: ``live`` for a real model response, ``mock`` when sample data was
-            requested, ``fallback`` when live analysis failed and sample data was
-            substituted.
+        source: ``live`` for a real model response, ``mock`` when the Healthcare
+            sample was requested (Mock Mode), ``fallback`` when live analysis failed
+            and a rule-based brief built from the enquiry was substituted.
         provider: Provider id, or None for mock mode.
         model: Model name, or None for mock mode.
         error: Why live analysis failed (only set when ``source == "fallback"``).
@@ -102,7 +103,8 @@ def analyze_with_status(
         use_mock: If True, return sample data without any API call.
 
     Returns:
-        An AnalysisResult. Sample data is never labelled ``live``.
+        An AnalysisResult. Fallback and sample data are never labelled ``live``, and
+        the Healthcare sample is returned only in Mock Mode.
 
     Raises:
         ValueError: If the enquiry is empty or whitespace-only, or the provider
@@ -121,7 +123,7 @@ def analyze_with_status(
         # Only the provider id and error code are logged, never exception text.
         logger.error("Live analysis failed (provider=%s, code=%s).", llm.id, exc.code)
         return AnalysisResult(
-            brief=_build_mock_brief(),
+            brief=build_rule_based_brief(enquiry_text),
             source="fallback",
             provider=llm.id,
             model=llm.model,
@@ -140,9 +142,9 @@ def analyze_project_enquiry(
 ) -> ProjectBrief:
     """Analyze an enquiry and return only the ProjectBrief.
 
-    Backwards-compatible wrapper around ``analyze_with_status``. Sample data is
-    returned for mock mode and when live analysis fails, so callers that need to
-    tell the difference should use ``analyze_with_status``.
+    Backwards-compatible wrapper around ``analyze_with_status``. The Healthcare
+    sample is returned in mock mode and a rule-based brief when live analysis
+    fails, so callers that need to tell them apart should use ``analyze_with_status``.
 
     Raises:
         ValueError: If the enquiry is empty or whitespace-only.

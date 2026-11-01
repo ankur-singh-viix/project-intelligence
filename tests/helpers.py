@@ -57,6 +57,7 @@ def openai_client(parsed=None, content=None, error: Exception | None = None) -> 
 
 def gemini_client(text=None, error: Exception | None = None) -> MagicMock:
     client = MagicMock()
+    client.models.get.return_value = SimpleNamespace(supported_actions=["generateContent"])
     if error is not None:
         client.models.generate_content.side_effect = error
     else:

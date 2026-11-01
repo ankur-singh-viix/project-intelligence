@@ -16,7 +16,7 @@ from core.providers.base import (
 # instruction together with JSON mode (the Gemma family).
 _EXCLUDED_MODEL_TERMS = (
     "embedding", "imagen", "veo", "tts", "image", "live", "audio", "aqa",
-    "robotics", "computer-use", "learnlm", "nano", "banana",
+    "robotics", "computer-use", "learnlm", "nano", "banana", "video",
 )
 
 # Phrases in 400/404 messages meaning "this model can't do what we asked".
@@ -55,10 +55,10 @@ class GeminiProvider(BaseProvider):
     )
 
     def _generate(self, enquiry_text: str) -> ProjectBrief:
-        from google import genai
         from google.genai import types
 
-        client = genai.Client(api_key=self.api_key)
+        client = self._client()
+        self._check_model(client)
         response = client.models.generate_content(
             model=self.model,
             contents=format_enquiry(enquiry_text),
@@ -78,13 +78,49 @@ class GeminiProvider(BaseProvider):
             )
         return self.parse_json_output(text)
 
-    # ------------------------------------------------------------- discovery
-    def _list_models(self) -> list[ModelInfo]:
-        """Return models that support generateContent and can plausibly emit JSON."""
+    def _client(self):
+        """One client factory so discovery and generation always use the same key and backend."""
         from google import genai
 
+        return genai.Client(api_key=self.api_key)
+
+    def _check_model(self, client) -> None:
+        """Confirm the selected model exists and supports generateContent before generating.
+
+        Only definite answers stop the request (unknown model, wrong key, or a model
+        that cannot generate text). Rate limits and network errors on this lookup are
+        ignored so the generation call reports the real outcome.
+        """
+        from google.genai import errors
+
+        try:
+            info = client.models.get(model=self.model)
+        except errors.APIError as exc:
+            if (exc.code or 0) in (401, 403, 404) or "api_key_invalid" in f"{exc.status} {exc}".lower():
+                raise self._translate_api_error(exc) from None
+            return
+        except Exception:
+            return
+        actions = getattr(info, "supported_actions", None)
+        if isinstance(actions, (list, tuple, set)) and actions and "generateContent" not in actions:
+            raise self.error(
+                ErrorCode.UNSUPPORTED_MODEL,
+                f"{self.model} does not support generateContent. Refresh the model list.",
+            )
+
+    # ------------------------------------------------------------- discovery
+    def _list_models(self) -> list[ModelInfo]:
+        """Return models that support generateContent and can plausibly emit JSON.
+
+        Identifiers are exactly what Google returns (minus the "models/" prefix the
+        SDK adds back). Being listed does not guarantee quota for that model.
+        """
         found: dict[str, ModelInfo] = {}
-        for model in genai.Client(api_key=self.api_key).models.list():
+        # Keep a reference to the client while paging: the SDK closes a client as soon
+        # as it is garbage-collected, which broke iteration over later pages
+        # ("Cannot send a request, as the client has been closed").
+        client = self._client()
+        for model in list(client.models.list()):
             actions = getattr(model, "supported_actions", None)
             if actions is not None and "generateContent" not in actions:
                 continue
@@ -146,15 +182,21 @@ class GeminiProvider(BaseProvider):
             return self.error(ErrorCode.MODEL_NOT_FOUND, f"Model: {self.model}. {detail or ''}".strip())
         if any(hint in text for hint in _UNSUPPORTED_HINTS):
             return self.error(ErrorCode.UNSUPPORTED_MODEL, detail)
+        if code == 400 or status == "INVALID_ARGUMENT":
+            return self.error(ErrorCode.INVALID_REQUEST, detail)
         if isinstance(exc, errors.ServerError) or code >= 500:
             return self.error(ErrorCode.UNAVAILABLE, detail)
         return self.error(ErrorCode.UNKNOWN, detail)
 
     @staticmethod
     def _quota_code(text: str) -> str:
-        """Tell per-minute throttling from exhausted quota using Gemini's quota ids."""
+        """Tell exhausted quota from short-term throttling using Gemini's quota ids.
+
+        A daily or generic "quota exceeded" is treated as exhausted quota; only a
+        purely per-minute violation is reported as a rate limit.
+        """
+        if "perday" in text or "per day" in text:
+            return ErrorCode.QUOTA
         if "perminute" in text or "per minute" in text:
             return ErrorCode.RATE_LIMIT
-        if "perday" in text or "per day" in text or "quota" in text:
-            return ErrorCode.QUOTA
-        return ErrorCode.RATE_LIMIT
+        return ErrorCode.QUOTA if "quota" in text else ErrorCode.RATE_LIMIT

@@ -97,7 +97,8 @@ def test_provider_failure_is_fallback_with_reason_and_no_secret(monkeypatch, cap
         result = analyze_with_status("build a shop", provider="openai", api_key=SECRET)
     assert result.source == "fallback"
     assert result.error.code == code
-    assert result.brief == _build_mock_brief()
+    assert result.brief != _build_mock_brief()  # Never the Healthcare sample.
+    assert "keyword rules" in result.brief.risk_assessment
     assert SECRET not in result.error.message
     assert SECRET not in caplog.text
     assert "provider=openai" in caplog.text and code in caplog.text
@@ -125,7 +126,8 @@ def test_backwards_compatible_wrapper_returns_projectbrief(monkeypatch):
     monkeypatch.setattr(OPENAI_MODULE, lambda **kw: openai_client(parsed=make_brief()))
     live = analyze_project_enquiry("x", api_key="k")  # defaults to OpenAI
     assert isinstance(live, ProjectBrief) and live.project_category == "E-commerce Platform"
-    assert analyze_project_enquiry("x") == _build_mock_brief()  # no key -> sample
+    fallback = analyze_project_enquiry("x")  # no key -> rule-based fallback, not the sample
+    assert fallback != _build_mock_brief() and fallback.project_category == "General Software Project"
 
 
 def test_mock_brief_is_a_valid_projectbrief():

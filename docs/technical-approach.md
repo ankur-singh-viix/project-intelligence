@@ -194,7 +194,7 @@ This supports:
 - Predictable sample output for evaluation.
 - Testing of the dashboard and JSON export functionality.
 
-The interface explicitly labels mock output as sample data and warns users that it does not reflect their submitted enquiry.
+The interface explicitly labels mock output as sample data and warns users that it does not reflect their submitted enquiry. A failed live call instead produces the rule-based fallback described in section 5.4.
 
 ### 5.3 Missing API Credentials
 
@@ -206,7 +206,7 @@ If the selected provider is not configured, the application runs in mock mode, e
 
 Each provider translates its SDK's exceptions into a small set of normalised errors: missing key, invalid key, permission or project access denied, rate limit, quota exhausted, billing restriction, network failure, provider unavailable, model not found, model does not support the required output, invalid structured output, and (for Ollama) server not running. Distinct failures are never collapsed into one generic message; for example, a missing model and an unsupported-output model produce different errors. Each message includes the provider's own HTTP status and message, after redacting the configured key and known key formats.
 
-When a live request fails, the analyzer logs only the provider and error code, and returns an `AnalysisResult` whose source is `fallback`, whose error explains the failure, and whose brief is the predefined sample. The interface shows the error, labels the output as fallback sample data, and never presents it as a live result. Because the analyzer now returns this status explicitly, the interface no longer infers fallback by comparing the result with the sample.
+When a live request fails, or the selected provider is not configured, the analyzer logs only the provider and error code, and returns an `AnalysisResult` whose source is `fallback`, whose error explains the failure, and whose brief is built from the user's own enquiry by a small keyword-rule generator (`core/fallback.py`). That brief is not AI output: it recognises a few common business domains, extracts mentioned user roles and capabilities, marks everything else as assumed, and says in its assumptions that it is rule-based. The interface shows the error, labels the output as a rule-based fallback, and never presents it as a live result. The predefined Healthcare sample is returned only in Mock Mode, so a failed call can never show data about an unrelated project.
 
 Gemini returns rate-limit and quota exhaustion under the same HTTP status, so they are told apart on a best-effort basis from the quota identifiers in the provider's message. OpenAI-compatible JSON mode is retried once without the JSON option if a model rejects it, and the reply is still validated against the schema.
 

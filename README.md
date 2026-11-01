@@ -35,7 +35,7 @@ The generated brief can also be downloaded as a JSON file.
 - **Interactive dashboard:** Provides a clean Streamlit interface for submitting enquiries and reviewing results.
 - **JSON export:** Downloads the generated discovery brief in a structured JSON format.
 - **Mock execution mode:** Demonstrates the application without requiring any provider or API key.
-- **Transparent fallback:** If credentials are missing or a live request fails, sample data is shown, labelled as fallback, together with the reason. It is never presented as a live result.
+- **Transparent fallback:** If credentials are missing or a live request fails, a rule-based brief built from your own enquiry is shown (keyword rules, not AI), labelled as fallback together with the reason. It is never presented as a live result, and the Healthcare sample is used only in Mock Mode.
 
 ## Technology Stack
 
@@ -220,8 +220,8 @@ The result caption names the provider and model only when the response really ca
 The result is always labelled with how it was produced:
 
 - **Live AI Analysis Successful** - a real response from the named provider and model.
-- **Mock Demo Output — Built-in sample data** - Mock Mode, or the selected provider was not configured.
-- **Live AI Analysis Failed — Showing Mock Fallback** - the live call failed. The reason is shown, and the sample brief below it does not reflect your enquiry.
+- **Mock Demo Output — Built-in sample data** - Mock Mode only.
+- **Live AI Analysis Failed — Showing Rule-Based Fallback** - the live call failed, or the provider is not configured. The reason is shown (expand **Technical details** for the redacted provider response), and the brief below is built from your enquiry by simple keyword rules, not by an AI model. Treat it as a rough starting point.
 
 Failures are reported specifically rather than as one generic error: invalid API key, permission or project access denied, model not found, model does not support the required output, rate limit, quota exhausted, billing restriction, network failure, provider unavailable, Ollama not running, and invalid or schema-violating output.
 
@@ -315,7 +315,8 @@ The tests mock every provider SDK, so they need no API keys, network access or p
 | "Could not list available models" | The key is wrong, or the provider is unreachable. The built-in names are shown instead; you can still enter a custom model. |
 | "Could not reach the Ollama server" | Start Ollama (`ollama serve`) and check the Server URL. For a model that is not downloaded, run `ollama pull <model>`. |
 | "returned a response that does not match the expected brief structure" | The model did not produce valid JSON for the schema. Retry or use a larger or different model. |
-| Sample Healthcare data appears for an unrelated enquiry | That is Mock or FALLBACK output. Check the result caption and the error above it. |
+| Sample Healthcare data appears for an unrelated enquiry | That only happens in Mock Mode. Turn off **Enable Mock Mode (Testing)**. |
+| "Showing Rule-Based Fallback" | Live analysis failed or the provider is not configured. Read the error under the banner; the brief is keyword-based, not AI output. |
 | `streamlit` is not recognized (Windows) | Use `python -m streamlit run app.py`. |
 
 ## Documentation
@@ -330,6 +331,7 @@ Additional project documentation:
 This repository demonstrates a proof of concept, not a complete production deployment.
 
 - Mock Mode uses predefined sample data rather than performing AI inference.
+- The rule-based fallback recognises only a handful of common business domains by keywords. It cannot understand an enquiry the way a model can, so it is a rough outline, not an analysis.
 - Provider integrations are covered by mocked automated tests; they have not been exercised against the live provider APIs by the automated suite. Model discovery depends on each provider's listing API, and Gemini rate-limit and quota responses are told apart on a best-effort basis from the provider's message.
 - The built-in fallback model names are not verified and may be outdated.
 - The result schema is fixed. Business objectives, user roles, assumptions and implementation considerations are returned inside the existing feature and risk fields (as labelled entries) rather than as separate fields.
