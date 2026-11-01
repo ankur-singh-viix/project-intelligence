@@ -95,9 +95,9 @@ The proof of concept uses the following technology stack:
 |---|---|---|
 | Programming language | Python | Application logic and AI integration |
 | User interface | Streamlit | Interactive discovery dashboard |
-| AI model | OpenAI GPT-4o-mini | Natural-language requirement analysis |
+| AI models | Provider-selectable: Google Gemini, OpenAI GPT, Groq, or local Ollama models | Natural-language requirement analysis |
 | Data validation | Pydantic | Structured output validation |
-| AI integration | OpenAI Python SDK | Communication with the LLM |
+| AI integration | Official provider SDKs (Google GenAI, OpenAI) and OpenAI-compatible APIs | Communication with the chosen LLM |
 | Configuration | python-dotenv | Environment-based API key management |
 
 The system also includes a mock execution mode that demonstrates the dashboard using clearly labelled sample data without requiring a live API call.

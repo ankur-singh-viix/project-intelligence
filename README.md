@@ -159,12 +159,25 @@ Select a provider in the sidebar. The key field, model list and setup hints chan
 
 | Provider | Key / setting | Default model | Other listed models | How structured output is obtained |
 |---|---|---|---|---|
-| Google Gemini | `GOOGLE_API_KEY` | `gemini-2.5-flash` | `gemini-2.5-flash-lite`, `gemini-2.5-pro` | JSON mode, validated against the Pydantic schema |
-| OpenAI (GPT) | `OPENAI_API_KEY`, optional `OPENAI_BASE_URL` | `gpt-4o-mini` | `gpt-4o`, `gpt-4.1-mini`, `gpt-4.1` | Native Pydantic structured parsing |
-| Groq | `GROQ_API_KEY`, optional `GROQ_BASE_URL` | `llama-3.3-70b-versatile` | `llama-3.1-8b-instant`, `openai/gpt-oss-20b` | JSON mode, validated against the Pydantic schema |
+| Google Gemini | `GOOGLE_API_KEY` | Chosen from your key's model list (newest stable Flash) | Everything your key can use for text generation. Fallback aliases: `gemini-flash-latest`, `gemini-flash-lite-latest`, `gemini-pro-latest` | JSON mode, validated against the Pydantic schema |
+| OpenAI (GPT) | `OPENAI_API_KEY`, optional `OPENAI_BASE_URL` | `gpt-4o-mini` if listed | Discovered chat models. Fallback: `gpt-4o`, `gpt-4.1-mini`, `gpt-4.1` | Native Pydantic structured parsing |
+| Groq | `GROQ_API_KEY`, optional `GROQ_BASE_URL` | `llama-3.3-70b-versatile` if listed | Discovered active chat models. Fallback: `llama-3.1-8b-instant`, `openai/gpt-oss-20b` | JSON mode, validated against the Pydantic schema |
 | Ollama (Local) | `OLLAMA_BASE_URL` (default `http://localhost:11434`), no key | `llama3.1` | Models installed on your server are detected automatically | JSON mode, validated against the Pydantic schema |
 
-Provider model names and availability change over time. The lists above are defaults, not guarantees: pick **Custom model name...** in the Model dropdown to use any model your account supports.
+Provider model names change often and old ones are retired, so the app does not rely on hardcoded names.
+
+### Model Discovery
+
+When a provider is configured, the app asks the provider which models are available to **your** credentials and fills the Model dropdown from the answer:
+
+- **Google Gemini:** the SDK's model listing, keeping models that support `generateContent`. Embedding, image, audio, live and Gemma models are left out because they cannot return the JSON this app needs.
+- **OpenAI:** the models list, keeping chat models.
+- **Groq:** the models list, keeping active chat models (speech and guard models are left out).
+- **Ollama:** the models installed on your server (`/api/tags`).
+
+The default is picked only from that verified list (for Gemini, the newest stable Flash model). Use **Refresh models** after changing your key or pulling a new model; lists are cached for about a minute. If discovery fails, the sidebar says why and falls back to built-in names, and you can always choose **Custom model name...** to type any model id. A custom model that is not in the discovered list is allowed but flagged.
+
+The built-in fallback names are not verified against live catalogues and may be outdated.
 
 Free-tier availability, quotas and model access depend on each provider and your account. This project does not assume any model is free.
 
@@ -192,7 +205,7 @@ Credentials are resolved in this order:
 2. Streamlit secrets (`.streamlit/secrets.toml` or the hosting platform's secrets).
 3. Environment variables, including values from `.env`.
 
-Keys loaded from secrets or the environment are never shown in the UI; the field only indicates that a key was found. Keys are not written to logs or error messages.
+Keys loaded from secrets or the environment are never shown in the UI; the field only indicates that a key was found. Keys are not written to logs, error messages or disk, and are only held in memory for your session. Error messages quote the provider's own message only after known key formats and your configured key are redacted.
 
 ## Usage Modes
 
@@ -204,7 +217,13 @@ Keys loaded from secrets or the environment are never shown in the UI; the field
 
 The result caption names the provider and model only when the response really came from that model.
 
-If the live request fails (invalid key, rate limit, insufficient quota, network error, provider outage, unsupported model, Ollama not running, or a response that does not match the schema), the app shows a plain-language error. It then shows the built-in sample brief clearly marked **FALLBACK sample data**; that sample does not reflect your enquiry.
+The result is always labelled with how it was produced:
+
+- **Live AI Analysis Successful** - a real response from the named provider and model.
+- **Mock Demo Output — Built-in sample data** - Mock Mode, or the selected provider was not configured.
+- **Live AI Analysis Failed — Showing Mock Fallback** - the live call failed. The reason is shown, and the sample brief below it does not reflect your enquiry.
+
+Failures are reported specifically rather than as one generic error: invalid API key, permission or project access denied, model not found, model does not support the required output, rate limit, quota exhausted, billing restriction, network failure, provider unavailable, Ollama not running, and invalid or schema-violating output.
 
 ### 2. Built-in Mock Mode
 
@@ -271,7 +290,7 @@ GROQ_API_KEY = "..."
 OLLAMA_BASE_URL = "http://your-ollama-host:11434"
 ```
 
-Only configure the providers you intend to offer. Ollama must be reachable from wherever the app runs; a hosted app cannot reach `localhost` on your own machine. Deployments with shared keys should also add authentication and usage limits, which this prototype does not include.
+Only configure the providers you intend to offer. Use Python 3.10 or newer (select it in the app's advanced settings on Streamlit Community Cloud). **Ollama on your own computer is not reachable from Streamlit Community Cloud**: a hosted app cannot reach `localhost` on your machine, so Ollama needs a server the app can reach (and you should not expose it publicly without protection). Deployments with shared keys should also add authentication and usage limits, which this prototype does not include.
 
 ## Running the Tests
 
@@ -288,8 +307,12 @@ The tests mock every provider SDK, so they need no API keys, network access or p
 |---|---|
 | "No API key is configured for ..." | Enter a key in the sidebar or set the provider's variable in `.env` / secrets, then restart the app after editing `.env`. |
 | "... rejected the API key" | The key is invalid, revoked, or lacks access to the selected model. |
-| "... rate limit or quota reached" / "insufficient quota" | Wait and retry, or check your plan, billing and quota with the provider. |
-| "The selected model is not available" | The model name is wrong or not enabled for your account. Choose another model or enter a custom name. |
+| "... rate limit reached" / "quota is exhausted" | Rate limit: wait and retry. Quota: check your plan, usage limits and billing with the provider. |
+| "The selected model was not found ..." | The model was retired, renamed, or is not enabled for your key. Click **Refresh models** and pick one from the list. The message includes the provider's own reason. |
+| "... does not support the JSON/structured output" | Choose a different model; some models (for example Gemma on Gemini) cannot return JSON. |
+| "... denied access" | The key's project or region is not allowed to use that API or model. Check the project in the provider console. |
+| "... billing or account restriction" | Enable billing or resolve the account issue with the provider. |
+| "Could not list available models" | The key is wrong, or the provider is unreachable. The built-in names are shown instead; you can still enter a custom model. |
 | "Could not reach the Ollama server" | Start Ollama (`ollama serve`) and check the Server URL. For a model that is not downloaded, run `ollama pull <model>`. |
 | "returned a response that does not match the expected brief structure" | The model did not produce valid JSON for the schema. Retry or use a larger or different model. |
 | Sample Healthcare data appears for an unrelated enquiry | That is Mock or FALLBACK output. Check the result caption and the error above it. |
@@ -307,7 +330,9 @@ Additional project documentation:
 This repository demonstrates a proof of concept, not a complete production deployment.
 
 - Mock Mode uses predefined sample data rather than performing AI inference.
-- Provider integrations are covered by mocked automated tests; they have not been exercised against the live provider APIs in this repository's test suite. Default model names may change as providers update their catalogues.
+- Provider integrations are covered by mocked automated tests; they have not been exercised against the live provider APIs by the automated suite. Model discovery depends on each provider's listing API, and Gemini rate-limit and quota responses are told apart on a best-effort basis from the provider's message.
+- The built-in fallback model names are not verified and may be outdated.
+- The result schema is fixed. Business objectives, user roles, assumptions and implementation considerations are returned inside the existing feature and risk fields (as labelled entries) rather than as separate fields.
 - Output quality and structured-output reliability vary by provider and model, especially for small local models.
 - AI-generated technical recommendations require human review.
 - The prototype does not persist project history in a database.

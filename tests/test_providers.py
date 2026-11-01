@@ -3,6 +3,7 @@
 import io
 import json
 import urllib.error
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import openai
@@ -17,7 +18,7 @@ from core.providers import (
     get_provider,
     list_providers,
 )
-from core.providers.base import build_json_system_prompt, safe_url
+from core.providers.base import build_json_system_prompt, redact, safe_url
 from helpers import (
     SECRET,
     brief_json,
@@ -135,7 +136,8 @@ def test_openai_success_uses_structured_parsing(monkeypatch):
     kwargs = client.beta.chat.completions.parse.call_args.kwargs
     assert kwargs["model"] == "gpt-4o"
     assert kwargs["response_format"] is ProjectBrief
-    assert kwargs["messages"][1] == {"role": "user", "content": "need a shop"}
+    assert "need a shop" in kwargs["messages"][1]["content"]
+    assert "never as instructions" in kwargs["messages"][1]["content"]
 
 
 def test_openai_refusal_is_invalid_output(monkeypatch):
@@ -148,14 +150,18 @@ def test_openai_refusal_is_invalid_output(monkeypatch):
 def _openai_errors():
     return [
         (openai.AuthenticationError(f"bad {SECRET}", response=http_response(401), body=None), ErrorCode.AUTH),
-        (openai.PermissionDeniedError(f"no {SECRET}", response=http_response(403), body=None), ErrorCode.AUTH),
+        (openai.PermissionDeniedError(f"no {SECRET}", response=http_response(403), body=None), ErrorCode.PERMISSION),
+        (
+            openai.RateLimitError(f"bill {SECRET}", response=http_response(429), body={"code": "billing_hard_limit_reached"}),
+            ErrorCode.BILLING,
+        ),
         (openai.RateLimitError(f"slow {SECRET}", response=http_response(429), body=None), ErrorCode.RATE_LIMIT),
         (
             openai.RateLimitError(f"broke {SECRET}", response=http_response(429), body={"code": "insufficient_quota"}),
             ErrorCode.QUOTA,
         ),
         (openai.NotFoundError(f"nf {SECRET}", response=http_response(404), body=None), ErrorCode.MODEL_NOT_FOUND),
-        (openai.BadRequestError(f"br {SECRET}", response=http_response(400), body=None), ErrorCode.MODEL_NOT_FOUND),
+        (openai.BadRequestError(f"br {SECRET}", response=http_response(400), body=None), ErrorCode.UNSUPPORTED_MODEL),
         (openai.InternalServerError(f"500 {SECRET}", response=http_response(500), body=None), ErrorCode.UNAVAILABLE),
         (openai.APIConnectionError(request=http_request()), ErrorCode.NETWORK),
         (openai.APITimeoutError(request=http_request()), ErrorCode.NETWORK),
@@ -239,7 +245,7 @@ def test_ollama_missing_model_suggests_pull(monkeypatch):
     assert "ollama pull llama9" in exc.value.message
 
 
-def test_ollama_lists_local_models(monkeypatch):
+def test_ollama_discovers_installed_models(monkeypatch):
     payload = json.dumps({"models": [{"name": "qwen2.5:7b"}, {"name": "llama3.1:8b"}]}).encode()
     seen = {}
 
@@ -248,25 +254,136 @@ def test_ollama_lists_local_models(monkeypatch):
         return io.BytesIO(payload)
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-    assert get_provider("ollama", base_url="http://box:11434/v1").list_local_models() == ["llama3.1:8b", "qwen2.5:7b"]
+    models = get_provider("ollama", base_url="http://box:11434/v1").discover_models()
+    assert [m.id for m in models] == ["llama3.1:8b", "qwen2.5:7b"]
     assert seen["url"] == "http://box:11434/api/tags"
 
 
-def test_ollama_list_models_server_down(monkeypatch):
+def test_ollama_pick_default_matches_tagged_model():
+    pick = PROVIDER_REGISTRY["ollama"].pick_default
+    assert pick(["qwen2.5:7b", "llama3.1:8b"]) == "llama3.1:8b"
+    assert pick(["qwen2.5:7b"]) == "qwen2.5:7b"
+    assert pick([]) == "llama3.1"
+
+
+def test_ollama_discovery_server_down(monkeypatch):
     def refuse(url, timeout):
         raise urllib.error.URLError("refused")
 
     monkeypatch.setattr("urllib.request.urlopen", refuse)
     with pytest.raises(ProviderError) as exc:
-        get_provider("ollama").list_local_models()
+        get_provider("ollama").discover_models()
     assert exc.value.code == ErrorCode.UNAVAILABLE
+    assert "ollama serve" in exc.value.message
 
 
-def test_ollama_list_models_bad_payload(monkeypatch):
+def test_ollama_discovery_bad_payload(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", lambda url, timeout: io.BytesIO(b"<html>"))
     with pytest.raises(ProviderError) as exc:
-        get_provider("ollama").list_local_models()
+        get_provider("ollama").discover_models()
     assert exc.value.code == ErrorCode.INVALID_OUTPUT
+
+
+def test_ollama_invalid_json_gets_helpful_hint(monkeypatch):
+    monkeypatch.setattr(OPENAI_MODULE, lambda **kw: openai_client(content="sure! here is your brief"))
+    with pytest.raises(ProviderError) as exc:
+        get_provider("ollama").analyze("x")
+    assert exc.value.code == ErrorCode.INVALID_OUTPUT
+    assert "larger" in exc.value.message
+
+
+# ------------------------------------------------------------ JSON-mode retry
+def test_json_mode_rejection_retries_without_response_format(monkeypatch):
+    rejected = openai.BadRequestError(
+        "response_format of type json_object is not supported with this model",
+        response=http_response(400),
+        body=None,
+    )
+    client = openai_client(content=brief_json())
+    ok = client.chat.completions.create.return_value
+    client.chat.completions.create.side_effect = [rejected, ok]
+    monkeypatch.setattr(OPENAI_MODULE, lambda **kw: client)
+    assert get_provider("groq", api_key="k").analyze("x") == make_brief()
+    calls = client.chat.completions.create.call_args_list
+    assert "response_format" in calls[0].kwargs and "response_format" not in calls[1].kwargs
+
+
+def test_other_bad_requests_are_not_retried(monkeypatch):
+    bad = openai.BadRequestError("context length exceeded", response=http_response(400), body=None)
+    client = openai_client(error=bad)
+    monkeypatch.setattr(OPENAI_MODULE, lambda **kw: client)
+    with pytest.raises(ProviderError) as exc:
+        get_provider("groq", api_key="k").analyze("x")
+    assert exc.value.code == ErrorCode.UNSUPPORTED_MODEL
+    assert client.chat.completions.create.call_count == 1
+
+
+# ------------------------------------------------------------ OpenAI / Groq discovery
+class _Model:
+    def __init__(self, id, active=None):
+        self.id = id
+        if active is not None:
+            self.active = active
+
+
+def test_openai_discovery_keeps_only_chat_models(monkeypatch):
+    client = MagicMock()
+    names = ["gpt-4o-mini", "gpt-4.1", "text-embedding-3-small", "whisper-1", "gpt-4o-audio-preview", "dall-e-3", "o3-mini", "gpt-image-1"]
+    client.models.list.return_value = [_Model(i) for i in names]
+    monkeypatch.setattr(OPENAI_MODULE, lambda **kw: client)
+    ids = [m.id for m in get_provider("openai", api_key="k").discover_models()]
+    assert ids == ["gpt-4.1", "gpt-4o-mini", "o3-mini"]
+
+
+def test_openai_pick_default():
+    pick = PROVIDER_REGISTRY["openai"].pick_default
+    assert pick(["gpt-4o-mini", "gpt-4.1"]) == "gpt-4o-mini"
+    assert pick(["gpt-5-mini", "gpt-5"]) == "gpt-5-mini"
+    assert pick(["o3"]) == "o3"
+
+
+def test_groq_discovery_skips_inactive_and_non_chat(monkeypatch):
+    client = MagicMock()
+    client.models.list.return_value = [
+        _Model("llama-3.3-70b-versatile", True),
+        _Model("whisper-large-v3", True),
+        _Model("meta-llama/llama-guard-4-12b", True),
+        _Model("old-model", False),
+        _Model("openai/gpt-oss-20b", True),
+    ]
+    factory = MagicMock(return_value=client)
+    monkeypatch.setattr(OPENAI_MODULE, factory)
+    ids = [m.id for m in get_provider("groq", api_key="k").discover_models()]
+    assert ids == ["llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
+    assert factory.call_args.kwargs["base_url"] == "https://api.groq.com/openai/v1"
+
+
+def test_discovery_requires_configuration_and_maps_errors(monkeypatch):
+    with pytest.raises(ProviderError) as exc:
+        get_provider("openai").discover_models()
+    assert exc.value.code == ErrorCode.MISSING_KEY
+    client = MagicMock()
+    client.models.list.side_effect = openai.AuthenticationError(f"bad {SECRET}", response=http_response(401), body=None)
+    monkeypatch.setattr(OPENAI_MODULE, lambda **kw: client)
+    with pytest.raises(ProviderError) as exc:
+        get_provider("openai", api_key=SECRET).discover_models()
+    assert exc.value.code == ErrorCode.AUTH and SECRET not in exc.value.message
+
+
+# ------------------------------------------------------------ redaction
+def test_redact_removes_known_key_formats():
+    text = "k=AIzaSyA1234567890abcdefghij sk-abcdef123456 gsk_abcdef123456 Bearer abc.def ?key=xyz123&a=1 mine-SECRET"
+    out = redact(text, ("mine-SECRET",))
+    for leaked in ("AIzaSyA", "sk-abcdef", "gsk_abcdef", "abc.def", "xyz123", "mine-SECRET"):
+        assert leaked not in out
+
+
+def test_safe_detail_redacts_provider_message():
+    message = f"models/x not found for key {SECRET} AIzaSyA1234567890abcdefghij"
+    err = genai_errors.ClientError(404, {"error": {"code": 404, "status": "NOT_FOUND", "message": message}})
+    detail = get_provider("gemini", api_key=SECRET).safe_detail(err)
+    assert "HTTP 404 NOT_FOUND" in detail and "models/x not found" in detail
+    assert SECRET not in detail and "AIzaSyA" not in detail
 
 
 # ------------------------------------------------------------ Gemini
@@ -284,24 +401,35 @@ def test_gemini_success_requests_json_and_validates(monkeypatch):
     assert factory.call_args.kwargs == {"api_key": SECRET}
     kwargs = client.models.generate_content.call_args.kwargs
     assert kwargs["model"] == "gemini-2.5-pro"
-    assert kwargs["contents"] == "need a shop"
+    assert "need a shop" in kwargs["contents"]
     assert kwargs["config"].response_mime_type == "application/json"
     assert "JSON Schema" in kwargs["config"].system_instruction
 
 
-def _gemini_errors():
-    def api(cls, code, status, message):
-        return cls(code, {"error": {"code": code, "status": status, "message": f"{message} {SECRET}"}})
+def _gemini_api_error(cls, code, status, message):
+    return cls(code, {"error": {"code": code, "status": status, "message": f"{message} {SECRET}"}})
 
+
+def _gemini_errors():
     class ConnectError(Exception):
         pass
 
+    api = _gemini_api_error
+    client_error, server_error = genai_errors.ClientError, genai_errors.ServerError
+    per_minute = "Quota exceeded for GenerateRequestsPerMinutePerProjectPerModel"
+    per_day = "You exceeded your current quota: GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+    not_found = "models/x is not found for API version v1beta, or is not supported for generateContent."
     return [
-        (api(genai_errors.ClientError, 400, "INVALID_ARGUMENT", "API key not valid."), ErrorCode.AUTH),
-        (api(genai_errors.ClientError, 403, "PERMISSION_DENIED", "denied"), ErrorCode.AUTH),
-        (api(genai_errors.ClientError, 429, "RESOURCE_EXHAUSTED", "quota"), ErrorCode.RATE_LIMIT),
-        (api(genai_errors.ClientError, 404, "NOT_FOUND", "model missing"), ErrorCode.MODEL_NOT_FOUND),
-        (api(genai_errors.ServerError, 503, "UNAVAILABLE", "overloaded"), ErrorCode.UNAVAILABLE),
+        (api(client_error, 400, "INVALID_ARGUMENT", "API key not valid. Please pass a valid API key."), ErrorCode.AUTH),
+        (api(client_error, 401, "UNAUTHENTICATED", "bad credentials"), ErrorCode.AUTH),
+        (api(client_error, 403, "PERMISSION_DENIED", "project denied access"), ErrorCode.PERMISSION),
+        (api(client_error, 400, "FAILED_PRECONDITION", "Billing must be enabled for this project"), ErrorCode.BILLING),
+        (api(client_error, 429, "RESOURCE_EXHAUSTED", per_minute), ErrorCode.RATE_LIMIT),
+        (api(client_error, 429, "RESOURCE_EXHAUSTED", per_day), ErrorCode.QUOTA),
+        (api(client_error, 404, "NOT_FOUND", not_found), ErrorCode.MODEL_NOT_FOUND),
+        (api(client_error, 400, "INVALID_ARGUMENT", "JSON mode is not enabled for models/gemma-3-27b-it"), ErrorCode.UNSUPPORTED_MODEL),
+        (api(client_error, 400, "INVALID_ARGUMENT", "Developer instruction is not enabled for models/gemma"), ErrorCode.UNSUPPORTED_MODEL),
+        (api(server_error, 503, "UNAVAILABLE", "overloaded"), ErrorCode.UNAVAILABLE),
         (ConnectError(f"dns {SECRET}"), ErrorCode.NETWORK),
         (RuntimeError(f"boom {SECRET}"), ErrorCode.UNKNOWN),
     ]
@@ -312,9 +440,90 @@ def test_gemini_error_mapping_never_leaks_key(monkeypatch):
         _patch_gemini(monkeypatch, gemini_client(error=exc))
         with pytest.raises(ProviderError) as caught:
             get_provider("gemini", api_key=SECRET).analyze("x")
-        assert caught.value.code == expected, type(exc).__name__
+        assert caught.value.code == expected, (type(exc).__name__, caught.value.code)
         assert SECRET not in caught.value.message
         assert caught.value.__cause__ is None
+
+
+def test_gemini_not_found_shows_model_and_provider_reason(monkeypatch):
+    err = _gemini_api_error(
+        genai_errors.ClientError, 404, "NOT_FOUND", "models/gemini-2.5-flash is not found for API version v1beta"
+    )
+    _patch_gemini(monkeypatch, gemini_client(error=err))
+    with pytest.raises(ProviderError) as exc:
+        get_provider("gemini", api_key="k", model="gemini-2.5-flash").analyze("x")
+    assert "gemini-2.5-flash" in exc.value.message and "HTTP 404 NOT_FOUND" in exc.value.message
+
+
+def test_gemini_empty_response_reports_safety_block(monkeypatch):
+    client = gemini_client(text=None)
+    client.models.generate_content.return_value.prompt_feedback = SimpleNamespace(block_reason="SAFETY")
+    _patch_gemini(monkeypatch, client)
+    with pytest.raises(ProviderError) as exc:
+        get_provider("gemini", api_key="k").analyze("x")
+    assert exc.value.code == ErrorCode.INVALID_OUTPUT and "safety" in exc.value.message.lower()
+
+
+# ---- Gemini model discovery
+def _gemini_model(name, actions=("generateContent",)):
+    listed = list(actions) if actions is not None else None
+    return SimpleNamespace(name=f"models/{name}", supported_actions=listed, display_name=name)
+
+
+def test_gemini_discovery_filters_by_capability(monkeypatch):
+    client = MagicMock()
+    client.models.list.return_value = iter(
+        [
+            _gemini_model("gemini-3-flash"),
+            _gemini_model("gemini-3-pro"),
+            _gemini_model("gemini-flash-latest"),
+            _gemini_model("gemini-embedding-001", actions=("embedContent",)),
+            _gemini_model("gemini-3-flash-image"),
+            _gemini_model("gemini-live-3-flash", actions=("bidiGenerateContent",)),
+            _gemini_model("gemini-3-flash-tts"),
+            _gemini_model("gemma-3-27b-it"),
+            _gemini_model("imagen-4", actions=("predict",)),
+            _gemini_model("gemini-legacy", actions=None),
+        ]
+    )
+    factory = _patch_gemini(monkeypatch, client)
+    ids = [m.id for m in get_provider("gemini", api_key=SECRET).discover_models()]
+    assert ids == ["gemini-3-flash", "gemini-3-pro", "gemini-flash-latest", "gemini-legacy"]
+    assert factory.call_args.kwargs == {"api_key": SECRET}
+
+
+def test_gemini_discovery_errors_are_classified(monkeypatch):
+    err = _gemini_api_error(genai_errors.ClientError, 400, "INVALID_ARGUMENT", "API key not valid.")
+    client = MagicMock()
+    client.models.list.side_effect = err
+    _patch_gemini(monkeypatch, client)
+    with pytest.raises(ProviderError) as exc:
+        get_provider("gemini", api_key=SECRET).discover_models()
+    assert exc.value.code == ErrorCode.AUTH and SECRET not in exc.value.message
+    with pytest.raises(ProviderError) as exc:
+        get_provider("gemini").discover_models()
+    assert exc.value.code == ErrorCode.MISSING_KEY
+
+
+@pytest.mark.parametrize(
+    "ids, expected",
+    [
+        (["gemini-2.5-flash", "gemini-3-flash", "gemini-3-pro", "gemini-flash-latest"], "gemini-3-flash"),
+        (["gemini-2.5-flash", "gemini-2.10-flash"], "gemini-2.10-flash"),
+        (["gemini-3-pro", "gemini-flash-latest"], "gemini-flash-latest"),
+        (["gemini-pro-latest", "gemini-flash-lite-latest"], "gemini-flash-lite-latest"),
+        (["gemini-3-pro-preview", "gemini-4-flash-preview"], "gemini-3-pro-preview"),
+        ([], "gemini-flash-latest"),
+    ],
+)
+def test_gemini_default_is_chosen_from_verified_list(ids, expected):
+    assert PROVIDER_REGISTRY["gemini"].pick_default(ids) == expected
+
+
+def test_gemini_static_fallback_uses_aliases_not_versioned_names():
+    cls = PROVIDER_REGISTRY["gemini"]
+    assert cls.default_model == "gemini-flash-latest"
+    assert all(m.endswith("-latest") for m in cls.models)
 
 
 @pytest.mark.parametrize("text", [None, "", "oops", json.dumps({"project_category": "x"})])

@@ -6,7 +6,7 @@ import urllib.request
 
 import openai
 
-from core.providers.base import ErrorCode, ProviderError, safe_url
+from core.providers.base import ErrorCode, ModelInfo, ProviderError, safe_url
 from core.providers.openai_provider import OpenAICompatibleProvider
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
@@ -23,7 +23,12 @@ class OllamaProvider(OpenAICompatibleProvider):
     supports_base_url = True
     base_url_env_var = "OLLAMA_BASE_URL"
     default_base_url = DEFAULT_OLLAMA_URL
+    supports_model_discovery = True
     request_timeout = 180.0  # Local models can be slow, especially on first load.
+    invalid_output_hint = (
+        "Small local models often struggle to produce valid JSON; try a larger or "
+        "instruction-tuned model."
+    )
     setup_help = (
         "Install Ollama (ollama.com), start it (`ollama serve`), then download a "
         "model, for example `ollama pull llama3.1`. The default server URL is "
@@ -52,20 +57,24 @@ class OllamaProvider(OpenAICompatibleProvider):
             )
         return super()._translate_error(exc)
 
-    def list_local_models(self, timeout: float = 2.0) -> list[str]:
-        """Return the names of models installed on the Ollama server.
-
-        Raises:
-            ProviderError: If the server cannot be reached or answers unexpectedly.
-        """
+    def _list_models(self, timeout: float = 2.0) -> list[ModelInfo]:
+        """Return models installed on the server, via Ollama's /api/tags endpoint."""
         url = (self.base_url or DEFAULT_OLLAMA_URL).rstrip("/")
         if url.endswith("/v1"):
             url = url[: -len("/v1")]
         try:
             with urllib.request.urlopen(f"{url}/api/tags", timeout=timeout) as response:
                 payload = json.load(response)
-            return sorted(m["name"] for m in payload.get("models", []))
+            return [ModelInfo(n, n) for n in sorted(m["name"] for m in payload.get("models", []))]
         except (urllib.error.URLError, TimeoutError, OSError):
             raise self._connection_error() from None
         except (ValueError, KeyError, TypeError, AttributeError):
-            raise self.error(ErrorCode.INVALID_OUTPUT) from None
+            raise self.error(ErrorCode.INVALID_OUTPUT, "Ollama returned an unexpected model list.") from None
+
+    @classmethod
+    def pick_default(cls, model_ids: list[str]) -> str:
+        """Prefer the default model (matching any tag), else the first installed one."""
+        for mid in model_ids:
+            if mid == cls.default_model or mid.split(":")[0] == cls.default_model:
+                return mid
+        return model_ids[0] if model_ids else cls.default_model

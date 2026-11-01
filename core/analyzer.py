@@ -45,11 +45,14 @@ def _build_mock_brief() -> ProjectBrief:
     return ProjectBrief(
         project_category="Healthcare SaaS",
         core_features=[
+            "Business objective: reduce front-desk workload and missed appointments",
+            "User role: Patient - registers, books, reschedules and cancels appointments",
+            "User role: Doctor - manages availability and views the daily schedule",
+            "User role: Clinic administrator - manages users, doctors and appointments",
             "Online appointment booking and rescheduling for patients",
             "Doctor availability and calendar management",
             "Automated email/SMS appointment reminders",
             "Patient profiles with visit history",
-            "Role-based access for patients, doctors and clinic administrators",
             "Admin dashboard for appointments and clinic reporting",
         ],
         recommended_tech_stack=TechStack(
@@ -66,13 +69,16 @@ def _build_mock_brief() -> ProjectBrief:
             "What are the budget, timeline and preferred hosting environment?",
         ],
         risk_assessment=(
-            "Security: patient data is highly sensitive, so encryption in transit "
-            "and at rest, strict access control and audit logging are required. "
-            "Privacy/compliance: HIPAA/GDPR obligations are unconfirmed and could "
-            "affect hosting and design. Scalability: multi-clinic growth and "
-            "reminder bursts need to be planned for. Integration: EHR/EMR "
-            "connections may add significant effort. Operational: downtime or "
-            "missed reminders directly affect patient care and clinic revenue."
+            "Risks: patient data is highly sensitive, so encryption in transit and "
+            "at rest, strict access control and audit logging are required; "
+            "HIPAA/GDPR obligations could affect hosting and design; multi-clinic "
+            "growth and reminder bursts need capacity planning; EHR/EMR integration "
+            "may add significant effort; missed reminders directly affect patient "
+            "care and clinic revenue. "
+            "Assumptions: web application with email/SMS reminders (assumed); "
+            "single country of operation (assumed). "
+            "Implementation considerations: role-based access from the start, "
+            "background jobs for reminders, and an audit trail for record access."
         ),
     )
 

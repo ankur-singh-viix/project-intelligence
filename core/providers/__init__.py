@@ -4,7 +4,7 @@ To add a provider: subclass ``BaseProvider``, then add the class to
 ``_BUILTIN_PROVIDERS`` (or call ``register_provider``).
 """
 
-from core.providers.base import BaseProvider, ErrorCode, ProviderError
+from core.providers.base import BaseProvider, ErrorCode, ModelInfo, ProviderError
 from core.providers.gemini_provider import GeminiProvider
 from core.providers.groq_provider import GroqProvider
 from core.providers.ollama_provider import OllamaProvider
@@ -56,6 +56,7 @@ def get_provider(
 __all__ = [
     "BaseProvider",
     "ErrorCode",
+    "ModelInfo",
     "ProviderError",
     "PROVIDER_REGISTRY",
     "get_provider",

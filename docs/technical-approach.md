@@ -56,7 +56,7 @@ This modular structure makes it easier to maintain the application and extend it
 
 ### 2.1 Model Choice: Provider-Specific Defaults
 
-The prototype is provider-independent. Each provider has a default model (OpenAI: `gpt-4o-mini`, Google Gemini: `gemini-2.5-flash`, Groq: `llama-3.3-70b-versatile`, Ollama: `llama3.1`), and users can select another listed model or enter a custom model name. Model names and availability change over time and are not assumed to be the same across providers. Free-tier availability and quotas depend on the provider and account, and no model is assumed to be free.
+The prototype is provider-independent and does not rely on hardcoded model names. Where the provider offers a model-listing API (Gemini, OpenAI, Groq and Ollama all do), the app lists the models available to the configured credentials, filters them to text-generation models, and picks the default only from that verified list. A built-in fallback list (for Gemini, Google's `*-latest` aliases) is used only when discovery is unavailable, and users can always enter a custom model name. Model names and availability change over time and are not assumed to be the same across providers. Free-tier availability and quotas depend on the provider and account, and no model is assumed to be free.
 
 The notes below use OpenAI's `gpt-4o-mini` as the worked example for requirement analysis and preliminary technical recommendations.
 
@@ -115,7 +115,7 @@ Providers differ in how reliably they follow a JSON schema, so the structured-ou
 - **OpenAI:** the SDK's structured parsing interface, `client.beta.chat.completions.parse()`, with the system prompt, the client enquiry, and the Pydantic `ProjectBrief` model as `response_format`. The SDK returns a validated Pydantic object.
 - **Google Gemini, Groq, Ollama:** JSON mode (Gemini's `response_mime_type="application/json"`, or `response_format={"type": "json_object"}` on the OpenAI-compatible endpoints). The shared system prompt is extended with the `ProjectBrief` JSON Schema, and the returned text is parsed and validated against `ProjectBrief`. The schema is described in the prompt rather than passed to the Gemini SDK, because Gemini supports only a subset of JSON Schema.
 
-In every case, empty, non-JSON, or schema-violating output is rejected with a clear "invalid structured output" error instead of being passed to the interface.
+In every case, empty, non-JSON, or schema-violating output is rejected with a clear "invalid structured output" error instead of being passed to the interface. The client enquiry is wrapped in markers and presented to every provider as untrusted data. The result schema is unchanged: business objectives and user roles are returned as labelled entries in the feature list, and assumptions and implementation considerations as labelled parts of the risk text, so the existing validation, export and interface keep working for all providers.
 
 This approach reduces dependence on fragile regex-based extraction.
 
@@ -204,11 +204,11 @@ If the selected provider is not configured, the application runs in mock mode, e
 
 ### 5.4 API Failure Handling
 
-Each provider translates its SDK's exceptions into a small set of normalised errors: missing key, invalid key, rate limit, insufficient quota, network failure, provider unavailable, unsupported model, invalid structured output, and (for Ollama) server not running.
+Each provider translates its SDK's exceptions into a small set of normalised errors: missing key, invalid key, permission or project access denied, rate limit, quota exhausted, billing restriction, network failure, provider unavailable, model not found, model does not support the required output, invalid structured output, and (for Ollama) server not running. Distinct failures are never collapsed into one generic message; for example, a missing model and an unsupported-output model produce different errors. Each message includes the provider's own HTTP status and message, after redacting the configured key and known key formats.
 
 When a live request fails, the analyzer logs only the provider and error code, and returns an `AnalysisResult` whose source is `fallback`, whose error explains the failure, and whose brief is the predefined sample. The interface shows the error, labels the output as fallback sample data, and never presents it as a live result. Because the analyzer now returns this status explicitly, the interface no longer infers fallback by comparing the result with the sample.
 
-The Gemini rate-limit and quota responses share one HTTP status, so they are reported together as a rate-limit/quota condition.
+Gemini returns rate-limit and quota exhaustion under the same HTTP status, so they are told apart on a best-effort basis from the quota identifiers in the provider's message. OpenAI-compatible JSON mode is retried once without the JSON option if a model rejects it, and the reply is still validated against the schema.
 
 ### 5.5 Security Considerations
 

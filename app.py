@@ -1,6 +1,8 @@
 """Streamlit frontend for Project Intelligence — AI Project Discovery & Scoping Copilot."""
 
+import hashlib
 import os
+import zlib
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -39,15 +41,24 @@ def reset_state() -> None:
         st.session_state[key] = value
 
 
-@st.cache_data(ttl=10, show_spinner=False)
-def detect_local_models(provider_id: str, base_url: str) -> tuple[list[str], str | None]:
-    """Ask a local provider (Ollama) which models are installed.
+def bump_refresh() -> None:
+    """Invalidate cached model lists (used by the Refresh models button)."""
+    st.session_state["refresh_nonce"] = st.session_state.get("refresh_nonce", 0) + 1
 
-    Returns (models, error_message); error_message is None on success.
+
+# `_api_key` is underscore-prefixed so Streamlit does not hash it into the cache key;
+# a short fingerprint keys the cache instead, so the key itself is never stored.
+@st.cache_data(ttl=60, show_spinner=False)
+def discover_models(
+    provider_id: str, key_fingerprint: str, base_url: str, nonce: int, _api_key: str | None
+) -> tuple[list[str], str | None]:
+    """Ask the provider which models are available to the current credentials.
+
+    Returns (model_ids, error_message); error_message is None on success.
     """
     try:
-        probe = get_provider(provider_id, base_url=base_url)
-        return probe.list_local_models(), None
+        probe = get_provider(provider_id, api_key=_api_key, base_url=base_url or None)
+        return [m.id for m in probe.discover_models()], None
     except ProviderError as exc:
         return [], exc.message
 
@@ -74,6 +85,9 @@ with st.sidebar:
         key="provider_id",
     )
     provider_cls = PROVIDER_REGISTRY[provider_id]
+    # Streamlit drops the state of widgets that are not rendered, so each provider's
+    # entries are kept here (in memory, this session only) to survive provider switches.
+    saved = st.session_state.setdefault("saved_settings", {}).setdefault(provider_id, {})
 
     # Credentials: a key entered here wins over Streamlit secrets and the environment.
     api_key = None
@@ -82,11 +96,13 @@ with st.sidebar:
         session_key = st.text_input(
             f"{provider_cls.label} API Key",
             type="password",
+            value=saved.get("api_key", ""),
             key=f"api_key_{provider_id}",
             placeholder="Using key from secrets/environment" if default_key else "Paste your API key",
             help=f"Used for this session only. Defaults to {provider_cls.env_var} from "
             "Streamlit secrets or your environment.",
         )
+        saved["api_key"] = session_key
         api_key = session_key.strip() or default_key or None
 
     base_url = None
@@ -98,31 +114,59 @@ with st.sidebar:
             with st.expander("Advanced"):
                 typed_url = st.text_input(
                     "API base URL (optional)",
+                    value=saved.get("base_url", ""),
                     key=f"base_url_{provider_id}",
                     placeholder=default_url or "Provider default",
                 )
+            saved["base_url"] = typed_url
             base_url = typed_url.strip() or default_url or None
         else:
             typed_url = st.text_input(
-                "Local server URL", value=default_url, key=f"base_url_{provider_id}"
+                "Local server URL",
+                value=saved.get("base_url", default_url),
+                key=f"base_url_{provider_id}",
             )
+            saved["base_url"] = typed_url
             base_url = typed_url.strip() or default_url
 
-    # Models: provider-specific defaults, or whatever a local server reports.
-    model_options = list(provider_cls.models)
-    local_error = None
-    if hasattr(provider_cls, "list_local_models"):
-        found, local_error = detect_local_models(provider_id, base_url or "")
-        if found:
-            model_options = found
+    # Configuration status for the selected provider only.
+    config_error: ProviderError | None = None
+    try:
+        get_provider(provider_id, api_key=api_key, base_url=base_url).validate_config()
+    except ProviderError as exc:
+        config_error = exc
+
+    # Models: discovered from the provider for these credentials when possible.
+    discovered: list[str] = []
+    discovery_error = None
+    if provider_cls.supports_model_discovery and config_error is None:
+        discovered, discovery_error = discover_models(
+            provider_id,
+            hashlib.sha256((api_key or "").encode()).hexdigest()[:12],
+            base_url or "",
+            st.session_state.get("refresh_nonce", 0),
+            api_key,
+        )
+    model_options = discovered or list(provider_cls.models)
+    choices = [*model_options, CUSTOM_MODEL]
+    remembered = saved.get("model_choice")
+    default_model = remembered if remembered in choices else provider_cls.pick_default(model_options)
     choice = st.selectbox(
         "Model",
-        options=[*model_options, CUSTOM_MODEL],
-        key=f"model_{provider_id}_{abs(hash(tuple(model_options))) % 10**6}",
+        options=choices,
+        index=choices.index(default_model) if default_model in choices else 0,
+        key=f"model_{provider_id}_{zlib.crc32('|'.join(model_options).encode())}",
     )
+    saved["model_choice"] = choice
     model = choice
     if choice == CUSTOM_MODEL:
-        model = st.text_input("Custom model name", key=f"custom_model_{provider_id}").strip() or None
+        custom = st.text_input(
+            "Custom model name", value=saved.get("custom_model", ""), key=f"custom_model_{provider_id}"
+        )
+        saved["custom_model"] = custom
+        model = custom.strip() or None
+    if provider_cls.supports_model_discovery and config_error is None:
+        st.button("Refresh models", key=f"refresh_{provider_id}", on_click=bump_refresh)
     st.caption(
         "Free-tier availability, quotas and model access depend on the provider and "
         "your account."
@@ -135,17 +179,21 @@ with st.sidebar:
     st.divider()
 
     llm = get_provider(provider_id, api_key=api_key, model=model, base_url=base_url)
-    config_error: ProviderError | None = None
-    try:
-        llm.validate_config()
-    except ProviderError as exc:
-        config_error = exc
     if config_error is not None:
         st.warning(config_error.message)
-    if local_error is not None:
-        st.warning(local_error)
-    if config_error is not None or local_error is not None:
         st.info(f"Setup: {provider_cls.setup_help}")
+    elif discovery_error is not None:
+        st.warning(f"Could not list available models. {discovery_error}")
+        st.caption("Showing built-in model names instead. You can also enter a custom model name.")
+        if not provider_cls.requires_api_key:
+            st.info(f"Setup: {provider_cls.setup_help}")
+    elif discovered:
+        st.caption(f"Connected. {len(discovered)} models available for this configuration.")
+        if model and model not in discovered:
+            st.caption(
+                f"Note: {model} was not in the list returned for this configuration "
+                "and may fail."
+            )
 
     if mock_enabled:
         requested_mode = "Mock Mode (enabled by user)"
@@ -221,14 +269,17 @@ if brief is None:
     st.info("No discovery brief yet. Enter a client enquiry above and select Generate Discovery Brief.")
 else:
     if info["source"] == "live":
-        confirmed = f"Live AI result from {info['provider_label']} ({info['model']})"
+        st.success(
+            f"Live AI Analysis Successful — {info['provider_label']} ({info['model']})"
+        )
     elif info["source"] == "mock":
-        confirmed = "Mock sample data"
+        st.info("Mock Demo Output — Built-in sample data")
     else:
-        confirmed = "FALLBACK sample data (live analysis failed)"
-    st.caption(f"Requested mode: {info['requested']}  |  Confirmed result: {confirmed}")
-    if info["source"] == "fallback":
-        st.error(f"Live analysis with {info['provider_label']} failed. {info['error']}")
+        st.error(
+            "Live AI Analysis Failed — Showing Mock Fallback. "
+            f"Provider: {info['provider_label']}. {info['error']}"
+        )
+    st.caption(f"Requested mode: {info['requested']}")
     if info["source"] != "live":
         st.warning(
             "This output is built-in sample Healthcare SaaS data and does not reflect "
