@@ -1,4 +1,5 @@
 streamlit
 openai
+google-genai
 pydantic
 python-dotenv

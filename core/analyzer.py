@@ -1,22 +1,43 @@
-"""AI analysis engine: turns a raw client enquiry into a structured ProjectBrief."""
+"""AI analysis engine: turns a raw client enquiry into a structured ProjectBrief.
+
+The engine is provider-independent: the actual model call is delegated to a
+provider from ``core.providers`` and the outcome is reported explicitly as live,
+mock or fallback data.
+"""
 
 import logging
-import os
-
-from openai import (
-    APIConnectionError,
-    AuthenticationError,
-    OpenAI,
-    OpenAIError,
-    RateLimitError,
-)
+from dataclasses import dataclass
+from typing import Literal
 
 from core.models import ProjectBrief, TechStack
-from core.prompts import SYSTEM_PROMPT
+from core.providers import ProviderError, get_provider
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "gpt-4o-mini"
+DEFAULT_PROVIDER = "openai"
+
+Source = Literal["live", "mock", "fallback"]
+
+
+@dataclass(frozen=True)
+class AnalysisResult:
+    """A ProjectBrief together with how it was produced.
+
+    Attributes:
+        brief: The validated brief.
+        source: ``live`` for a real model response, ``mock`` when sample data was
+            requested, ``fallback`` when live analysis failed and sample data was
+            substituted.
+        provider: Provider id, or None for mock mode.
+        model: Model name, or None for mock mode.
+        error: Why live analysis failed (only set when ``source == "fallback"``).
+    """
+
+    brief: ProjectBrief
+    source: Source
+    provider: str | None = None
+    model: str | None = None
+    error: ProviderError | None = None
 
 
 def _build_mock_brief() -> ProjectBrief:
@@ -56,76 +77,75 @@ def _build_mock_brief() -> ProjectBrief:
     )
 
 
-def _resolve_api_key(api_key: str | None) -> str | None:
-    """Return the explicit API key, else OPENAI_API_KEY from the environment."""
-    key = api_key if api_key and api_key.strip() else os.environ.get("OPENAI_API_KEY")
-    return key.strip() if key and key.strip() else None
+def analyze_with_status(
+    enquiry_text: str,
+    provider: str = DEFAULT_PROVIDER,
+    api_key: str | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    use_mock: bool = False,
+) -> AnalysisResult:
+    """Analyze an enquiry and report whether the result is live, mock or fallback.
 
+    Args:
+        enquiry_text: The client's project enquiry.
+        provider: Provider id (see ``core.providers.PROVIDER_REGISTRY``).
+        api_key: API key; falls back to the provider's environment variable.
+        model: Model name; defaults to the provider's default model.
+        base_url: Optional API base URL for providers that support one.
+        use_mock: If True, return sample data without any API call.
 
-def _call_openai(enquiry_text: str, api_key: str) -> ProjectBrief:
-    """Request a structured ProjectBrief from OpenAI.
+    Returns:
+        An AnalysisResult. Sample data is never labelled ``live``.
 
     Raises:
-        OpenAIError: On any API failure.
-        ValueError: If the model returns no parsed result (e.g. a refusal).
+        ValueError: If the enquiry is empty or whitespace-only, or the provider
+            id is unknown.
     """
-    client = OpenAI(api_key=api_key)
-    response = client.beta.chat.completions.parse(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": enquiry_text},
-        ],
-        response_format=ProjectBrief,
-    )
-    parsed = response.choices[0].message.parsed
-    if parsed is None:
-        raise ValueError("Model returned no parsed ProjectBrief.")
-    return parsed
+    if not isinstance(enquiry_text, str) or not enquiry_text.strip():
+        raise ValueError("Enquiry text must not be empty.")
+
+    if use_mock:
+        return AnalysisResult(brief=_build_mock_brief(), source="mock")
+
+    llm = get_provider(provider, api_key=api_key, model=model, base_url=base_url)
+    try:
+        brief = llm.analyze(enquiry_text.strip())
+    except ProviderError as exc:
+        # Only the provider id and error code are logged, never exception text.
+        logger.error("Live analysis failed (provider=%s, code=%s).", llm.id, exc.code)
+        return AnalysisResult(
+            brief=_build_mock_brief(),
+            source="fallback",
+            provider=llm.id,
+            model=llm.model,
+            error=exc,
+        )
+    return AnalysisResult(brief=brief, source="live", provider=llm.id, model=llm.model)
 
 
 def analyze_project_enquiry(
     enquiry_text: str,
     api_key: str | None = None,
     use_mock: bool = False,
+    provider: str = DEFAULT_PROVIDER,
+    model: str | None = None,
+    base_url: str | None = None,
 ) -> ProjectBrief:
-    """Analyze a raw client enquiry and return a structured ProjectBrief.
+    """Analyze an enquiry and return only the ProjectBrief.
 
-    Args:
-        enquiry_text: The client's project enquiry.
-        api_key: OpenAI API key. Falls back to the OPENAI_API_KEY environment
-            variable when omitted.
-        use_mock: If True, return predefined mock data without any API call.
-
-    Returns:
-        A validated ProjectBrief. Mock data is returned when ``use_mock`` is
-        set, when no API key is available, or when the live call fails.
+    Backwards-compatible wrapper around ``analyze_with_status``. Sample data is
+    returned for mock mode and when live analysis fails, so callers that need to
+    tell the difference should use ``analyze_with_status``.
 
     Raises:
         ValueError: If the enquiry is empty or whitespace-only.
     """
-    if not isinstance(enquiry_text, str) or not enquiry_text.strip():
-        raise ValueError("Enquiry text must not be empty.")
-
-    if use_mock:
-        return _build_mock_brief()
-
-    key = _resolve_api_key(api_key)
-    if key is None:
-        logger.warning("No OpenAI API key available; returning mock data.")
-        return _build_mock_brief()
-
-    # Only exception types are logged, never messages, which could echo secrets.
-    try:
-        return _call_openai(enquiry_text.strip(), key)
-    except AuthenticationError:
-        logger.error("OpenAI authentication failed; returning mock data.")
-    except RateLimitError:
-        logger.error("OpenAI rate limit or quota exceeded; returning mock data.")
-    except APIConnectionError:  # Includes APITimeoutError.
-        logger.error("Could not reach OpenAI (connection/timeout); returning mock data.")
-    except OpenAIError as exc:
-        logger.error("OpenAI API error (%s); returning mock data.", type(exc).__name__)
-    except Exception as exc:  # Parsing/validation or other unexpected failures.
-        logger.error("Unexpected analysis failure (%s); returning mock data.", type(exc).__name__)
-    return _build_mock_brief()
+    return analyze_with_status(
+        enquiry_text,
+        provider=provider,
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        use_mock=use_mock,
+    ).brief

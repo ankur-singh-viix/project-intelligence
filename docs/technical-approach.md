@@ -15,10 +15,11 @@ The AI Project Discovery & Scoping Copilot is a lightweight AI-powered applicati
 The architecture follows a simple application-layer design:
 
 1. **Presentation Layer:** Streamlit provides the interactive user interface for submitting project enquiries and reviewing discovery results.
-2. **AI Analysis Layer:** The analyzer module manages prompt construction, OpenAI API communication, and response processing.
-3. **Prompt Engineering Layer:** A dedicated system prompt guides the LLM to behave like a software solutions architect.
-4. **Data Validation Layer:** Pydantic models define the expected response structure and validate the generated output.
-5. **Fallback Layer:** Mock execution and error-handling mechanisms allow the application to demonstrate its functionality without depending entirely on API availability.
+2. **AI Analysis Layer:** The analyzer module selects a provider, delegates the model call, and reports whether the result is live, mock, or fallback data.
+3. **Provider Layer:** A common provider interface with interchangeable implementations for Google Gemini, OpenAI, Groq, and Ollama (local). Each provider handles its own SDK calls, configuration checks, and error translation.
+4. **Prompt Engineering Layer:** A dedicated system prompt guides the LLM to behave like a software solutions architect. All providers share it.
+5. **Data Validation Layer:** Pydantic models define the expected response structure, and every provider's output is validated against them.
+6. **Fallback Layer:** Mock execution and error-handling mechanisms allow the application to demonstrate its functionality without depending entirely on API availability.
 
 ### 1.2 Technology Choices
 
@@ -26,10 +27,11 @@ The architecture follows a simple application-layer design:
 |---|---|---|
 | Python | Core application language | Strong ecosystem for AI/ML development, API integration, and data validation. |
 | Streamlit | Frontend framework | Enables rapid development of interactive data applications without requiring a separate frontend stack. |
-| OpenAI API | LLM integration | Provides natural-language understanding and structured response generation. |
-| GPT-4o-mini | AI model | Offers a practical balance of response quality, latency, and API cost. |
+| Google Gemini, OpenAI, Groq, Ollama | LLM providers | Interchangeable backends so users can choose by cost, quota, privacy (local models), or quality instead of being tied to one vendor. |
+| GPT-4o-mini (default for OpenAI) | AI model | Offers a practical balance of response quality, latency, and API cost. Each provider has its own default model, and any model name can be entered. |
 | Pydantic | Data validation | Defines typed data models and validates the structure of generated discovery briefs. |
-| OpenAI Python SDK | API integration | Supports structured response parsing and communication with the selected model. |
+| OpenAI Python SDK | API integration | Native structured parsing for OpenAI; also used for Groq and Ollama through their OpenAI-compatible endpoints. |
+| google-genai SDK | API integration | Official Google SDK for Gemini. |
 | python-dotenv | Configuration management | Loads environment variables, including API credentials, from a local `.env` file. |
 
 ### 1.3 Application Architecture
@@ -38,13 +40,13 @@ The application separates user interaction, AI processing, and data validation t
 
 **Request flow:**
 
-1. A user enters a client project enquiry in the Streamlit dashboard.
-2. The frontend passes the enquiry to `analyze_project_enquiry()`.
-3. The analyzer combines the enquiry with the predefined system prompt.
-4. The OpenAI API processes the request using GPT-4o-mini.
-5. The response is parsed into the `ProjectBrief` Pydantic model.
-6. The validated result is returned to the frontend.
-7. Streamlit displays the project overview, technology recommendations, features, clarification questions, and risk assessment.
+1. A user selects a provider and model, then enters a client project enquiry in the Streamlit dashboard.
+2. The frontend passes the enquiry and provider settings to `analyze_with_status()` (`analyze_project_enquiry()` remains as a wrapper that returns only the brief).
+3. The analyzer creates the selected provider through the provider factory.
+4. The provider validates its configuration, combines the enquiry with the shared system prompt, and calls its backend.
+5. The response is parsed into the `ProjectBrief` Pydantic model and validated.
+6. The analyzer returns an `AnalysisResult` containing the brief, its source (`live`, `mock`, or `fallback`), the provider and model, and any error.
+7. Streamlit displays the source label, any failure reason, the project overview, technology recommendations, features, clarification questions, and risk assessment.
 
 This modular structure makes it easier to maintain the application and extend its capabilities.
 
@@ -52,9 +54,11 @@ This modular structure makes it easier to maintain the application and extend it
 
 ## 2. Model Selection
 
-### 2.1 Selected Model: GPT-4o-mini
+### 2.1 Model Choice: Provider-Specific Defaults
 
-The prototype uses OpenAI's `gpt-4o-mini` model for requirement analysis and preliminary technical recommendations.
+The prototype is provider-independent. Each provider has a default model (OpenAI: `gpt-4o-mini`, Google Gemini: `gemini-2.5-flash`, Groq: `llama-3.3-70b-versatile`, Ollama: `llama3.1`), and users can select another listed model or enter a custom model name. Model names and availability change over time and are not assumed to be the same across providers. Free-tier availability and quotas depend on the provider and account, and no model is assumed to be free.
+
+The notes below use OpenAI's `gpt-4o-mini` as the worked example for requirement analysis and preliminary technical recommendations.
 
 The task primarily involves natural-language understanding, information extraction, classification, and structured response generation rather than computationally expensive model training.
 
@@ -104,22 +108,16 @@ The models use typed fields, validation rules, field descriptions, and restricti
 
 This creates a predictable contract between the AI analysis layer and the Streamlit presentation layer.
 
-### 3.3 OpenAI Structured Response Parsing
+### 3.3 Structured Response Parsing per Provider
 
-The analyzer uses the OpenAI Python SDK's structured parsing interface:
+Providers differ in how reliably they follow a JSON schema, so the structured-output mechanism is chosen per provider and validation is always applied on our side.
 
-`client.beta.chat.completions.parse()`
+- **OpenAI:** the SDK's structured parsing interface, `client.beta.chat.completions.parse()`, with the system prompt, the client enquiry, and the Pydantic `ProjectBrief` model as `response_format`. The SDK returns a validated Pydantic object.
+- **Google Gemini, Groq, Ollama:** JSON mode (Gemini's `response_mime_type="application/json"`, or `response_format={"type": "json_object"}` on the OpenAI-compatible endpoints). The shared system prompt is extended with the `ProjectBrief` JSON Schema, and the returned text is parsed and validated against `ProjectBrief`. The schema is described in the prompt rather than passed to the Gemini SDK, because Gemini supports only a subset of JSON Schema.
 
-The request specifies:
+In every case, empty, non-JSON, or schema-violating output is rejected with a clear "invalid structured output" error instead of being passed to the interface.
 
-- The selected model: `gpt-4o-mini`.
-- A system message containing the solution architect instructions.
-- A user message containing the client enquiry.
-- The Pydantic `ProjectBrief` model as the expected response format.
-
-The SDK parses the model response into a validated Pydantic object, which can then be used directly by the application.
-
-This approach reduces dependence on fragile regex-based extraction and manual JSON parsing.
+This approach reduces dependence on fragile regex-based extraction.
 
 **Important distinction:** Structured parsing and Pydantic validation help enforce the expected data structure and field types. They do not independently verify the factual accuracy, completeness, or technical suitability of the AI's recommendations. Human review remains necessary.
 
@@ -200,25 +198,23 @@ The interface explicitly labels mock output as sample data and warns users that 
 
 ### 5.3 Missing API Credentials
 
-The application checks for an API key supplied through the sidebar or the `OPENAI_API_KEY` environment variable.
+The application resolves the selected provider's API key in this order: a key entered in the sidebar for the current session, Streamlit secrets, then environment variables (`GOOGLE_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`). Ollama needs no key; it uses `OLLAMA_BASE_URL` or the default local URL.
 
-If neither is available, the application automatically uses mock execution mode and communicates this through the interface.
+If the selected provider is not configured, the application runs in mock mode, explains which setting is missing, and shows setup instructions.
 
 ### 5.4 API Failure Handling
 
-The analyzer handles common API failures, including authentication errors, rate limits, connection failures, timeouts, and unexpected exceptions.
+Each provider translates its SDK's exceptions into a small set of normalised errors: missing key, invalid key, rate limit, insufficient quota, network failure, provider unavailable, unsupported model, invalid structured output, and (for Ollama) server not running.
 
-When the live API request fails, the analyzer logs a limited diagnostic message and returns the predefined sample brief as a fallback.
+When a live request fails, the analyzer logs only the provider and error code, and returns an `AnalysisResult` whose source is `fallback`, whose error explains the failure, and whose brief is the predefined sample. The interface shows the error, labels the output as fallback sample data, and never presents it as a live result. Because the analyzer now returns this status explicitly, the interface no longer infers fallback by comparing the result with the sample.
 
-The frontend compares the result with the built-in sample and uses the available diagnostic information to communicate fallback status.
-
-This is an implementation-level fallback detection approach rather than an explicit status returned by the analyzer. A future improvement would be to return a structured result containing both the discovery brief and an execution status, making live-versus-fallback reporting more reliable.
+The Gemini rate-limit and quota responses share one HTTP status, so they are reported together as a rate-limit/quota condition.
 
 ### 5.5 Security Considerations
 
 The prototype follows basic credential-handling practices:
 
-- API keys are loaded from environment variables or entered through a password-type sidebar field.
+- API keys are loaded from Streamlit secrets or environment variables, or entered through a password-type sidebar field. Keys from secrets or the environment are never pre-filled into the interface.
 - The `.env` file is excluded from Git through `.gitignore`.
 - Sensitive API credentials are not intentionally displayed in the interface.
 - Error reporting avoids exposing full exception messages or API credentials.
@@ -233,12 +229,12 @@ The current implementation is a proof of concept rather than a production-ready 
 
 Potential improvements include:
 
-1. **Explicit execution metadata:** Return structured live/mock/fallback status from the analyzer rather than inferring it from sample output.
+1. **Live provider validation:** The provider integrations are covered by automated tests that mock the SDKs. They should also be exercised against each live API, and default model names reviewed as provider catalogues change.
 2. **Persistent project history:** Store previous discovery briefs for comparison and follow-up.
 3. **Document ingestion:** Support PDF, DOCX, and other client requirement documents.
 4. **Advanced architecture recommendations:** Consider hosting, deployment, cloud infrastructure, and integration patterns.
 5. **Human feedback loop:** Allow engineers to review and correct recommendations and use feedback to improve prompts.
-6. **Evaluation framework:** Test the system against representative, anonymized enquiries using measures such as extraction completeness, recommendation relevance, clarification-question quality, and risk identification.
+6. **Evaluation framework:** Test the system against representative, anonymized enquiries, and compare providers and models, using measures such as extraction completeness, recommendation relevance, clarification-question quality, and risk identification.
 7. **Production security:** Introduce authentication, authorization, secure secret management, monitoring, and data governance.
 
 ---
@@ -247,7 +243,7 @@ Potential improvements include:
 
 The Cynbit AI Discovery Copilot demonstrates a practical application of LLMs in the early stages of software project discovery.
 
-By combining prompt engineering, GPT-4o-mini, Pydantic validation, structured response parsing, and a Streamlit interface, the prototype converts unstructured client enquiries into consistent technical discovery briefs.
+By combining prompt engineering, interchangeable LLM providers, Pydantic validation, structured response parsing, and a Streamlit interface, the prototype converts unstructured client enquiries into consistent technical discovery briefs.
 
 The architecture prioritizes simplicity, modularity, predictable output structures, and graceful handling of API failures.
 
